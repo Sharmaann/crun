@@ -113,5 +113,6 @@ get_options ()
 int
 crun_command_create (struct crun_global_arguments *global_args, int argc, char **argv, libcrun_error_t *err)
 {
+  printf("finish");
   return crun_run_create_internal (global_args, argc, argv, libcrun_container_create, get_options, &crun_context, &run_argp, &config_file, &bundle, err);
 }
