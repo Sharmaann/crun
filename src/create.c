@@ -170,5 +170,7 @@ crun_command_create (struct crun_global_arguments *global_args, int argc, char *
       crun_context.preserve_fds += crun_context.listen_fds;
     }
 
-  return libcrun_container_create (&crun_context, container, 0, err);
+  int out = libcrun_container_create (&crun_context, container, 0, err);
+  printf("finish");
+  return out;
 }
