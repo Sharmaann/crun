@@ -125,7 +125,7 @@ crun_command_list (struct crun_global_arguments *global_args, int argc, char **a
   max_length++;
 
   if (! list_options.quiet)
-    printf ("%-*s%-10s%-8s %-39s %-30s %s\n", max_length, "NAME", "PID", "STATUS", "BUNDLE PATH", "CREATED", "OWNER");
+    printf ("%-*s%-10s%-8s %-39s %-30s %s\n", max_length, "NAME", "PID", "STATUS", "BUNDLE_PATH", "CREATED", "OWNER");
 
   for (it = list; it; it = it->next)
     {
