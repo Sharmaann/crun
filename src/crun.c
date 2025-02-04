@@ -448,7 +448,7 @@ fill_handler_from_argv0 (char *argv0, struct crun_global_arguments *args)
 //     libcrun_fail_with_error (err->status, "%s", err->msg);
 //   return ret;
 // }
-#include "../../src/main.c"
+#include "../../src/crun/main.c"
 // int main(){
 //   while (1){
 //     command_manager();
