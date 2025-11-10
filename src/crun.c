@@ -437,4 +437,4 @@ copy_args (char **argv, int argc)
 }
 
 
-#include "../../src/crun/main.c"
+#include "../main.c"
