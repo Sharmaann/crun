@@ -347,7 +347,9 @@ rmdir_all_fd (int dfd)
   dir = fdopendir (dfd);
   if (dir == NULL)
     {
+      int saved_errno = errno;
       TEMP_FAILURE_RETRY (close (dfd));
+      errno = saved_errno;
       return -1;
     }
 
@@ -377,7 +379,13 @@ rmdir_all_fd (int dfd)
 
           child_dfd = openat (dfd, name, O_DIRECTORY | O_CLOEXEC);
           if (child_dfd < 0)
-            return child_dfd;
+            {
+              int saved_errno = errno;
+              closedir (dir);
+              dir = NULL;
+              errno = saved_errno;
+              return child_dfd;
+            }
 
           ret = read_pids_cgroup (child_dfd, true, &pids, &n_pids, &allocated, &tmp_err);
           if (UNLIKELY (ret < 0))

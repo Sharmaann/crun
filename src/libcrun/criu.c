@@ -244,7 +244,7 @@ criu_notify (char *action, __attribute__ ((unused)) criu_notify_arg_t na)
 #  ifdef CRIU_PRE_DUMP_SUPPORT
 
 static int
-criu_check_mem_track (char *work_path, libcrun_error_t *err)
+criu_check_mem_track (libcrun_error_t *err)
 {
   struct criu_feature_check features = { 0 };
   int ret;
@@ -259,16 +259,12 @@ criu_check_mem_track (char *work_path, libcrun_error_t *err)
 
   ret = libcriu_wrapper->criu_feature_check (&features, sizeof (features));
   if (UNLIKELY (ret < 0))
-    return crun_make_error (err, 0,
-                            "CRIU feature checking failed %d.  Please check CRIU logfile %s/%s",
-                            ret, work_path, CRIU_CHECKPOINT_LOG_FILE);
+    return crun_make_error (err, 0, "CRIU feature checking failed: %d", ret);
 
   if (features.mem_track == true)
     return 1;
 
-  return crun_make_error (err, 0,
-                          "memory tracking not supported. Please check CRIU logfile %s/%s",
-                          work_path, CRIU_CHECKPOINT_LOG_FILE);
+  return crun_make_error (err, 0, "CRIU memory tracking not supported");
 }
 
 #  endif
@@ -498,6 +494,57 @@ handle_criu_config_file (libcrun_container_t *container, libcrun_error_t *err)
   return 0;
 }
 
+static int
+validate_criu_version (libcrun_error_t *err)
+{
+  int ret;
+
+  // validate that the libcriu version is at least LIBCRIU_MIN_VERSION
+  ret = libcriu_wrapper->criu_check_version (LIBCRIU_MIN_VERSION);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, -ret, "CRIU: failed checking version");
+
+  if (ret == 0)
+    return crun_make_error (err, 0, "libcriu is too old");
+
+  return 0;
+}
+
+static void
+show_criu_log (const char *work_path, const char *log)
+{
+  cleanup_free char *log_path = NULL;
+  libcrun_error_t *tmp_err = NULL;
+  char line[1024];
+  FILE *f;
+
+  if (UNLIKELY (append_paths (&log_path, tmp_err, work_path, log, NULL)) < 0)
+    {
+      crun_error_release (tmp_err);
+      return;
+    }
+
+  f = fopen (log_path, "r");
+  if (f == NULL)
+    {
+      if (errno != ENOENT)
+        libcrun_error (errno, "Can't open CRIU log `%s`", log_path);
+      return;
+    }
+
+  /* Log with error verbosity as this is the default. */
+  libcrun_error (0, "--- excerpt from CRIU log `%s`", log_path);
+  while (fgets (line, sizeof (line), f) != NULL)
+    if (strstr (line, "Error ") != NULL)
+      {
+        line[strcspn (line, "\n")] = '\0';
+        libcrun_error (0, "%s", line);
+      }
+
+  fclose (f);
+  libcrun_error (0, "--- end of excerpt");
+}
+
 int
 libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, libcrun_container_t *container,
                                          libcrun_checkpoint_restore_t *cr_options, libcrun_error_t *err)
@@ -541,8 +588,9 @@ libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, lib
   if (UNLIKELY (ret < 0))
     return crun_make_error (err, 0, "CRIU init failed with %d", ret);
 
-  if (! libcriu_wrapper->criu_check_version (LIBCRIU_MIN_VERSION))
-    return crun_make_error (err, 0, "libcriu is too old");
+  ret = validate_criu_version (err);
+  if (UNLIKELY (ret < 0))
+    return ret;
 
   if (UNLIKELY (cr_options->image_path == NULL))
     return crun_make_error (err, 0, "image path not set");
@@ -602,7 +650,7 @@ libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, lib
      * changed compared to the previous dump. */
     if (cr_options->parent_path != NULL)
       {
-        criu_can_mem_track = criu_check_mem_track (cr_options->work_path, err);
+        criu_can_mem_track = criu_check_mem_track (err);
         if (UNLIKELY (criu_can_mem_track == -1))
           return -1;
         libcriu_wrapper->criu_set_track_mem (true);
@@ -628,16 +676,17 @@ libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, lib
       {
         if (criu_can_mem_track != 1)
           {
-            criu_can_mem_track = criu_check_mem_track (cr_options->work_path, err);
+            criu_can_mem_track = criu_check_mem_track (err);
             if (UNLIKELY (criu_can_mem_track == -1))
               return -1;
           }
         libcriu_wrapper->criu_set_track_mem (true);
         ret = libcriu_wrapper->criu_pre_dump ();
         if (UNLIKELY (ret != 0))
-          return crun_make_error (err, 0,
-                                  "CRIU pre-dump failed %d.  Please check CRIU logfile %s/%s",
-                                  ret, cr_options->work_path, CRIU_CHECKPOINT_LOG_FILE);
+          {
+            show_criu_log (cr_options->work_path, CRIU_CHECKPOINT_LOG_FILE);
+            return crun_make_error (err, 0, "CRIU pre-dump failed: %d", ret);
+          }
         return 0;
       }
   }
@@ -803,9 +852,10 @@ libcrun_container_checkpoint_linux_criu (libcrun_container_status_t *status, lib
 
   ret = libcriu_wrapper->criu_dump ();
   if (UNLIKELY (ret != 0))
-    return crun_make_error (err, ret < 0 ? -ret : 0,
-                            "CRIU checkpointing failed %d.  Please check CRIU logfile %s/%s",
-                            ret, cr_options->work_path, CRIU_CHECKPOINT_LOG_FILE);
+    {
+      show_criu_log (cr_options->work_path, CRIU_CHECKPOINT_LOG_FILE);
+      return crun_make_error (err, ret < 0 ? -ret : 0, "CRIU checkpointing failed: %d", ret);
+    }
 
   return 0;
 }
@@ -912,8 +962,9 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
   if (UNLIKELY (ret < 0))
     return crun_make_error (err, 0, "CRIU init failed with %d", ret);
 
-  if (! libcriu_wrapper->criu_check_version (LIBCRIU_MIN_VERSION))
-    return crun_make_error (err, 0, "libcriu is too old");
+  ret = validate_criu_version (err);
+  if (UNLIKELY (ret < 0))
+    return ret;
 
   if (UNLIKELY (cr_options->image_path == NULL))
     return crun_make_error (err, 0, "image path not set");
@@ -1087,66 +1138,100 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
       const int open_flags_for_inherit = O_RDONLY; /* Cannot be O_CLOEXEC as it is passed to the child process. */
       int value = libcrun_find_namespace (def->linux->namespaces[i]->type);
       if (UNLIKELY (value < 0))
-        return crun_make_error (err, 0, "invalid namespace type: `%s`", def->linux->namespaces[i]->type);
+        {
+          ret = crun_make_error (err, 0, "invalid namespace type: `%s`", def->linux->namespaces[i]->type);
+          goto out_umount;
+        }
 
       if (value == CLONE_NEWNET && def->linux->namespaces[i]->path != NULL)
         {
           inherit_new_net_fd = open (def->linux->namespaces[i]->path, open_flags_for_inherit);
           if (UNLIKELY (inherit_new_net_fd < 0))
-            return crun_make_error (err, errno, "unable to open(): `%s`", def->linux->namespaces[i]->path);
+            {
+              ret = crun_make_error (err, errno, "unable to open(): `%s`", def->linux->namespaces[i]->path);
+              goto out_umount;
+            }
 
           ret = libcriu_wrapper->criu_add_inherit_fd (inherit_new_net_fd, CRIU_EXT_NETNS);
           if (UNLIKELY (ret < 0))
-            return crun_make_error (err, -ret, "CRIU: failed adding fd");
+            {
+              ret = crun_make_error (err, -ret, "CRIU: failed adding fd");
+              goto out_umount;
+            }
         }
 
       if (value == CLONE_NEWPID && def->linux->namespaces[i]->path != NULL)
         {
           inherit_new_pid_fd = open (def->linux->namespaces[i]->path, open_flags_for_inherit);
           if (UNLIKELY (inherit_new_pid_fd < 0))
-            return crun_make_error (err, errno, "unable to open(): `%s`", def->linux->namespaces[i]->path);
+            {
+              ret = crun_make_error (err, errno, "unable to open(): `%s`", def->linux->namespaces[i]->path);
+              goto out_umount;
+            }
 
           ret = libcriu_wrapper->criu_add_inherit_fd (inherit_new_pid_fd, CRIU_EXT_PIDNS);
           if (UNLIKELY (ret < 0))
-            return crun_make_error (err, -ret, "CRIU: failed adding fd");
+            {
+              ret = crun_make_error (err, -ret, "CRIU: failed adding fd");
+              goto out_umount;
+            }
         }
 
 #  ifdef CRIU_JOIN_NS_SUPPORT
       if (value == CLONE_NEWTIME && def->linux->namespaces[i]->path != NULL)
         {
           if (libcriu_wrapper->criu_join_ns_add == NULL)
-            return crun_make_error (err, 0, "shared time namespace restore is supported in CRIU >= 3.16.1");
+            {
+              ret = crun_make_error (err, 0, "shared time namespace restore is supported in CRIU >= 3.16.1");
+              goto out_umount;
+            }
 
           ret = libcriu_wrapper->criu_join_ns_add ("time", def->linux->namespaces[i]->path, NULL);
           if (UNLIKELY (ret < 0))
-            return crun_make_error (err, -ret, "CRIU: failed adding external namespace `%s`", def->linux->namespaces[i]->path);
+            {
+              ret = crun_make_error (err, -ret, "CRIU: failed adding external namespace `%s`", def->linux->namespaces[i]->path);
+              goto out_umount;
+            }
         }
 
       if (value == CLONE_NEWIPC && def->linux->namespaces[i]->path != NULL)
         {
           if (libcriu_wrapper->criu_join_ns_add == NULL)
-            return crun_make_error (err, 0, "shared ipc namespace restore is supported in CRIU >= 3.16.1");
+            {
+              ret = crun_make_error (err, 0, "shared ipc namespace restore is supported in CRIU >= 3.16.1");
+              goto out_umount;
+            }
 
           ret = libcriu_wrapper->criu_join_ns_add ("ipc", def->linux->namespaces[i]->path, NULL);
           if (UNLIKELY (ret < 0))
-            return crun_make_error (err, -ret, "CRIU: failed adding external namespace `%s`", def->linux->namespaces[i]->path);
+            {
+              ret = crun_make_error (err, -ret, "CRIU: failed adding external namespace `%s`", def->linux->namespaces[i]->path);
+              goto out_umount;
+            }
         }
 
       if (value == CLONE_NEWUTS && def->linux->namespaces[i]->path != NULL)
         {
           if (libcriu_wrapper->criu_join_ns_add == NULL)
-            return crun_make_error (err, 0, "shared uts namespace restore is supported in CRIU >= 3.16.1");
+            {
+              ret = crun_make_error (err, 0, "shared uts namespace restore is supported in CRIU >= 3.16.1");
+              goto out_umount;
+            }
 
           ret = libcriu_wrapper->criu_join_ns_add ("uts", def->linux->namespaces[i]->path, NULL);
           if (UNLIKELY (ret < 0))
-            return crun_make_error (err, -ret, "CRIU: failed adding external namespace `%s`", def->linux->namespaces[i]->path);
+            {
+              ret = crun_make_error (err, -ret, "CRIU: failed adding external namespace `%s`", def->linux->namespaces[i]->path);
+              goto out_umount;
+            }
         }
 #  endif
     }
 
   /* Set up CRIU config file */
-  if (UNLIKELY (handle_criu_config_file (container, err)))
-    return -1;
+  ret = handle_criu_config_file (container, err);
+  if (UNLIKELY (ret < 0))
+    goto out_umount;
 
   /* Tell CRIU if cgroup v1 needs to be handled. */
   ret = restore_cgroup_v1_mount (def, err);
@@ -1168,7 +1253,10 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
     {
       ret = libcriu_wrapper->criu_add_cg_root (NULL, status->cgroup_path);
       if (UNLIKELY (ret != 0))
-        return crun_make_error (err, 0, "error setting CRIU cgroup root to `%s`", status->cgroup_path);
+        {
+          ret = crun_make_error (err, 0, "error setting CRIU cgroup root to `%s`", status->cgroup_path);
+          goto out_umount;
+        }
     }
 
   if (cr_options->manage_cgroups_mode == -1)
@@ -1182,13 +1270,19 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
     {
       ret = libcriu_wrapper->criu_set_network_lock (cr_options->network_lock_method);
       if (UNLIKELY (ret < 0))
-        return crun_make_error (err, 0, "CRIU: failed setting network lock");
+        {
+          ret = crun_make_error (err, 0, "CRIU: failed setting network lock");
+          goto out_umount;
+        }
     }
 
   libcriu_wrapper->criu_set_log_level (4);
   ret = libcriu_wrapper->criu_set_log_file (CRIU_RESTORE_LOG_FILE);
   if (UNLIKELY (ret < 0))
-    return crun_make_error (err, -ret, "error setting CRIU log file to `%s`", CRIU_RESTORE_LOG_FILE);
+    {
+      ret = crun_make_error (err, -ret, "error setting CRIU log file to `%s`", CRIU_RESTORE_LOG_FILE);
+      goto out_umount;
+    }
 
   /* criu_restore() returns the PID of the process of the restored process
    * tree. This PID will not be the same as status->pid if the container is
@@ -1196,9 +1290,8 @@ libcrun_container_restore_linux_criu (libcrun_container_status_t *status, libcru
   ret = libcriu_wrapper->criu_restore_child ();
   if (UNLIKELY (ret <= 0))
     {
-      ret = crun_make_error (err, 0,
-                             "CRIU restoring failed %d.  Please check CRIU logfile `%s/%s`",
-                             ret, cr_options->work_path, CRIU_RESTORE_LOG_FILE);
+      show_criu_log (cr_options->work_path, CRIU_RESTORE_LOG_FILE);
+      ret = crun_make_error (err, 0, "CRIU restoring failed: %d", ret);
       goto out_umount;
     }
 
@@ -1212,12 +1305,16 @@ out_umount:
   ret_out = umount (root);
   if (UNLIKELY (ret_out == -1))
     {
+      int saved_errno = errno;
       rmdir (root);
-      return crun_make_error (err, errno, "error unmounting restore directory `%s`", root);
+      if (ret < 0)
+        return crun_error_wrap (err, "error unmounting restore directory `%s`", root);
+      else
+        return crun_make_error (err, saved_errno, "error unmounting restore directory `%s`", root);
     }
 out:
   ret_out = rmdir (root);
-  if (UNLIKELY (ret == -1))
+  if (UNLIKELY (ret < 0))
     return ret;
   if (UNLIKELY (ret_out == -1))
     return crun_make_error (err, errno, "error removing restore directory `%s`", root);

@@ -692,7 +692,7 @@ initialize_security (libcrun_container_t *container, runtime_spec_schema_config_
 
 static int
 do_hooks (runtime_spec_schema_config_schema *def, pid_t pid, const char *id, bool keep_going, const char *cwd,
-          const char *status, hook **hooks, size_t hooks_len, int out_fd, int err_fd, libcrun_error_t *err)
+          const char *status, hook **hooks, size_t hooks_len, int out_fd, int err_fd, bool can_ignore_chdir_errors, libcrun_error_t *err)
 {
   size_t i, stdin_len;
   int r, ret;
@@ -818,7 +818,7 @@ do_hooks (runtime_spec_schema_config_schema *def, pid_t pid, const char *id, boo
         }
 
       ret = run_process_with_stdin_timeout_envp (hooks[i]->path, hooks[i]->args, cwd, hooks[i]->timeout, env,
-                                                 stdin, stdin_len, out_fd, err_fd, err);
+                                                 stdin, stdin_len, out_fd, err_fd, can_ignore_chdir_errors, err);
       if (UNLIKELY (ret < 0))
         error_created = true;
 
@@ -1153,18 +1153,6 @@ resolve_rootfs_path (libcrun_container_t *container, char **rootfs, libcrun_erro
   return 0;
 }
 
-/* Configure terminal socket pair for container communication.  */
-static int
-setup_terminal_socketpair (struct container_entrypoint_s *entrypoint_args, int *console_socketpair)
-{
-  if (entrypoint_args->terminal_socketpair[0] >= 0)
-    {
-      close_and_reset (&entrypoint_args->terminal_socketpair[0]);
-      *console_socketpair = entrypoint_args->terminal_socketpair[1];
-    }
-  return 0;
-}
-
 /* Initialize the environment variables.  */
 static int
 setup_environment (runtime_spec_schema_config_schema *def, uid_t container_uid, libcrun_error_t *err)
@@ -1186,10 +1174,11 @@ setup_environment (runtime_spec_schema_config_schema *def, uid_t container_uid, 
   if (getenv ("HOME") == NULL)
     {
       ret = set_home_env (container_uid);
-      if (UNLIKELY (ret < 0 && errno != ENOTSUP))
+      if (UNLIKELY (ret < 0))
         {
-          setenv ("HOME", "/", 1);
           libcrun_warning ("cannot detect HOME environment variable, setting default");
+          if (UNLIKELY (setenv ("HOME", "/", 1) < 0))
+            return crun_make_error (err, errno, "setenv HOME");
         }
     }
 
@@ -1331,9 +1320,12 @@ container_init_setup (void *args, pid_t own_pid, char *notify_socket,
   if (UNLIKELY (ret < 0))
     return ret;
 
-  ret = setup_terminal_socketpair (entrypoint_args, &console_socketpair);
-  if (UNLIKELY (ret < 0))
-    return ret;
+  /* Configure terminal socket pair for container communication.  */
+  if (entrypoint_args->terminal_socketpair[0] >= 0)
+    {
+      close_and_reset (&entrypoint_args->terminal_socketpair[0]);
+      console_socketpair = entrypoint_args->terminal_socketpair[1];
+    }
 
   /* sync 1.  */
   ret = sync_socket_wait_sync (NULL, sync_socket, false, err);
@@ -1359,9 +1351,13 @@ container_init_setup (void *args, pid_t own_pid, char *notify_socket,
 
   if (def->hooks && def->hooks->create_container_len)
     {
+      libcrun_error_t tmp_err = NULL;
+      int in_userns = check_running_in_user_namespace (&tmp_err);
+      if (tmp_err)
+        crun_error_release (&tmp_err);
       ret = do_hooks (def, 0, container->context->id, false, NULL, "created", (hook **) def->hooks->create_container,
                       def->hooks->create_container_len, entrypoint_args->hooks_out_fd, entrypoint_args->hooks_err_fd,
-                      err);
+                      in_userns > 0, err);
       if (UNLIKELY (ret != 0))
         return ret;
     }
@@ -1407,8 +1403,9 @@ container_init_setup (void *args, pid_t own_pid, char *notify_socket,
   /* Set primary process to 1 explicitly if nothing is configured and LISTEN_FD is not set.  */
   if (entrypoint_args->context->listen_fds > 0 && getenv ("LISTEN_PID") == NULL)
     {
-      setenv ("LISTEN_PID", "1", 1);
       libcrun_warning ("setting LISTEN_PID=1 since no previous configuration was found");
+      if (UNLIKELY (setenv ("LISTEN_PID", "1", 1) < 0))
+        return crun_make_error (err, errno, "setenv LISTENPID");
     }
 
   /* Attempt to chdir immediately here, before doing the setresuid.  If we fail here, let's
@@ -1663,10 +1660,14 @@ container_init (void *args, char *notify_socket, int sync_socket, libcrun_error_
   if (def->hooks && def->hooks->start_container_len)
     {
       libcrun_container_t *container = entrypoint_args->container;
+      libcrun_error_t tmp_err = NULL;
+      int in_userns = check_running_in_user_namespace (&tmp_err);
+      if (tmp_err)
+        crun_error_release (&tmp_err);
 
       ret = do_hooks (def, 0, container->context->id, false, NULL, "starting", (hook **) def->hooks->start_container,
                       def->hooks->start_container_len, entrypoint_args->hooks_out_fd, entrypoint_args->hooks_err_fd,
-                      err);
+                      in_userns > 0, err);
       if (UNLIKELY (ret != 0))
         return ret;
 
@@ -1682,7 +1683,17 @@ container_init (void *args, char *notify_socket, int sync_socket, libcrun_error_
          This is a best effort operation, because the seccomp filter is already in place and it could
          stop some syscalls used by mark_or_close_fds_ge_than.
       */
-      ret = mark_or_close_fds_ge_than (entrypoint_args->container, entrypoint_args->context->preserve_fds + 3, true, err);
+      if (entrypoint_args->custom_handler->vtable->close_fds)
+        {
+          ret = entrypoint_args->custom_handler->vtable->close_fds (entrypoint_args->custom_handler->cookie,
+                                                                    entrypoint_args->container,
+                                                                    entrypoint_args->context->preserve_fds,
+                                                                    err);
+        }
+      else
+        {
+          ret = mark_or_close_fds_ge_than (entrypoint_args->container, entrypoint_args->context->preserve_fds + 3, true, err);
+        }
       if (UNLIKELY (ret < 0))
         crun_error_release (err);
 
@@ -1713,7 +1724,7 @@ container_init (void *args, char *notify_socket, int sync_socket, libcrun_error_
                                                                exec_path,
                                                                def->process->args);
       if (ret != 0)
-        return crun_make_error (err, ret, "exec container process failed with handler as `%s`", entrypoint_args->custom_handler->vtable->name);
+        return crun_make_error (err, 0, "exec container process failed with handler as `%s`", entrypoint_args->custom_handler->vtable->name);
 
       return ret;
     }
@@ -1796,9 +1807,14 @@ run_poststop_hooks (libcrun_context_t *context, libcrun_container_t *container, 
         return ret;
 
       ret = do_hooks (def, 0, id, true, status->bundle, "stopped", (hook **) def->hooks->poststop,
-                      def->hooks->poststop_len, hooks_out_fd, hooks_err_fd, err);
-      if (UNLIKELY (ret < 0))
-        crun_error_write_warning_and_release (context->output_handler_arg, &err);
+                      def->hooks->poststop_len, hooks_out_fd, hooks_err_fd, false, err);
+      if (UNLIKELY (ret != 0))
+        {
+          if (ret < 0)
+            crun_error_write_warning_and_release (context->output_handler_arg, &err);
+          else
+            libcrun_error (0, "poststop hook failed with exit code: %d", ret);
+        }
     }
   return 0;
 }
@@ -2783,12 +2799,15 @@ libcrun_container_run_internal (libcrun_container_t *container, libcrun_context_
   const char *seccomp_bpf_data = find_annotation (container, "run.oci.seccomp_bpf_data");
   int cgroup_mode;
 
-  cgroup_mode = libcrun_get_cgroup_mode (err);
-  if (UNLIKELY (cgroup_mode < 0))
-    return cgroup_mode;
+  if (! context->force_no_cgroup)
+    {
+      cgroup_mode = libcrun_get_cgroup_mode (err);
+      if (UNLIKELY (cgroup_mode < 0))
+        return cgroup_mode;
 
-  if (cgroup_mode != CGROUP_MODE_UNIFIED)
-    libcrun_warning ("cgroup v1 is deprecated and will be removed in a future release.  Use cgroup v2");
+      if (cgroup_mode != CGROUP_MODE_UNIFIED)
+        libcrun_warning ("cgroup v1 is deprecated and will be removed in a future release.  Use cgroup v2");
+    }
 
   ret = setup_container_hooks_output (container, def, &container_args, &hooks_out_fd, &hooks_err_fd, err);
   if (UNLIKELY (ret < 0))
@@ -2928,7 +2947,7 @@ libcrun_container_run_internal (libcrun_container_t *container, libcrun_context_
     {
       libcrun_debug ("Running `prestart` hooks");
       ret = do_hooks (def, pid, context->id, false, NULL, "created", (hook **) def->hooks->prestart,
-                      def->hooks->prestart_len, hooks_out_fd, hooks_err_fd, err);
+                      def->hooks->prestart_len, hooks_out_fd, hooks_err_fd, false, err);
       if (UNLIKELY (ret != 0))
         goto fail;
     }
@@ -2936,7 +2955,7 @@ libcrun_container_run_internal (libcrun_container_t *container, libcrun_context_
     {
       libcrun_debug ("Running `create` hooks");
       ret = do_hooks (def, pid, context->id, false, NULL, "created", (hook **) def->hooks->create_runtime,
-                      def->hooks->create_runtime_len, hooks_out_fd, hooks_err_fd, err);
+                      def->hooks->create_runtime_len, hooks_out_fd, hooks_err_fd, false, err);
       if (UNLIKELY (ret != 0))
         goto fail;
     }
@@ -2980,7 +2999,7 @@ libcrun_container_run_internal (libcrun_container_t *container, libcrun_context_
     {
       libcrun_debug ("Running `poststart` hooks");
       ret = do_hooks (def, pid, context->id, false, NULL, "running", (hook **) def->hooks->poststart,
-                      def->hooks->poststart_len, hooks_out_fd, hooks_err_fd, err);
+                      def->hooks->poststart_len, hooks_out_fd, hooks_err_fd, false, err);
       if (UNLIKELY (ret != 0))
         goto fail;
     }
@@ -3408,9 +3427,14 @@ libcrun_container_start (libcrun_context_t *context, const char *id, libcrun_err
         return ret;
 
       ret = do_hooks (def, status.pid, context->id, false, status.bundle, "running", (hook **) def->hooks->poststart,
-                      def->hooks->poststart_len, hooks_out_fd, hooks_err_fd, err);
+                      def->hooks->poststart_len, hooks_out_fd, hooks_err_fd, false, err);
       if (UNLIKELY (ret != 0))
-        return ret;
+        {
+          libcrun_error_t tmp_err = NULL;
+          container_delete_internal (context, def, id, true, true, &tmp_err);
+          crun_error_release (&tmp_err);
+          return ret;
+        }
     }
 
   return 0;
@@ -3689,10 +3713,11 @@ exec_process_entrypoint (libcrun_context_t *context,
   if (getenv ("HOME") == NULL)
     {
       ret = set_home_env (container_uid);
-      if (UNLIKELY (ret < 0 && errno != ENOTSUP))
+      if (UNLIKELY (ret < 0))
         {
-          setenv ("HOME", "/", 1);
           libcrun_warning ("cannot detect HOME environment variable, setting default");
+          if (UNLIKELY (setenv ("HOME", "/", 1) < 0))
+            return crun_make_error (err, errno, "setenv HOME");
         }
     }
 
@@ -3968,7 +3993,7 @@ libcrun_container_exec_with_options (libcrun_context_t *context, const char *id,
       process = make_runtime_spec_schema_config_schema_process (tree, &ctx, &parser_err);
       if (UNLIKELY (process == NULL))
         {
-          ret = crun_make_error (err, errno, "cannot parse process file: `%s`", parser_err);
+          ret = crun_make_error (err, 0, "cannot parse process file: `%s`", parser_err);
           free (parser_err);
           if (tree)
             yajl_tree_free (tree);
@@ -4177,7 +4202,7 @@ libcrun_container_update (libcrun_context_t *context, const char *id, const char
   resources = make_runtime_spec_schema_config_linux_resources (tree, &ctx, &parser_err);
   if (UNLIKELY (resources == NULL))
     {
-      ret = crun_make_error (err, errno, "cannot parse resources: %s", parser_err);
+      ret = crun_make_error (err, 0, "cannot parse resources: %s", parser_err);
       goto cleanup;
     }
 
@@ -4501,7 +4526,7 @@ libcrun_container_pause (libcrun_context_t *context, const char *id, libcrun_err
   if (UNLIKELY (ret < 0))
     return ret;
   if (ret == 0)
-    return crun_make_error (err, errno, "the container `%s` is not running", id);
+    return crun_make_error (err, 0, "the container `%s` is not running", id);
 
   return libcrun_container_pause_linux (&status, err);
 }
@@ -4521,7 +4546,7 @@ libcrun_container_unpause (libcrun_context_t *context, const char *id, libcrun_e
   if (UNLIKELY (ret < 0))
     return ret;
   if (ret == 0)
-    return crun_make_error (err, errno, "the container `%s` is not running", id);
+    return crun_make_error (err, 0, "the container `%s` is not running", id);
 
   return libcrun_container_unpause_linux (&status, err);
 }

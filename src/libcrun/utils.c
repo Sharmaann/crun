@@ -23,6 +23,7 @@
 #include <stdarg.h>
 #include <unistd.h>
 #include <string.h>
+#include <libgen.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -198,6 +199,7 @@ create_file_if_missing_at (int dirfd, const char *file, mode_t mode, libcrun_err
   cleanup_close int fd_write = openat (dirfd, file, O_CLOEXEC | O_CREAT | O_WRONLY, mode);
   if (fd_write < 0)
     {
+      int saved_errno = errno;
       mode_t tmp_mode;
       int ret;
 
@@ -206,7 +208,7 @@ create_file_if_missing_at (int dirfd, const char *file, mode_t mode, libcrun_err
       if (ret == 0 && S_ISREG (tmp_mode))
         return 0;
 
-      return crun_make_error (err, errno, "create file `%s`", file);
+      return crun_make_error (err, saved_errno, "create file `%s`", file);
     }
   return 0;
 }
@@ -754,16 +756,21 @@ libcrun_initialize_apparmor (libcrun_error_t *err)
   if (apparmor_enabled >= 0)
     return apparmor_enabled;
 
-  if (crun_dir_p_at (AT_FDCWD, "/sys/kernel/security/apparmor", true, err))
+  fd = open ("/sys/module/apparmor/parameters/enabled", O_RDONLY | O_CLOEXEC);
+  if (fd == -1)
     {
-      fd = open ("/sys/module/apparmor/parameters/enabled", O_RDONLY | O_CLOEXEC);
-      if (fd == -1)
-        return 0;
+      if (errno == ENOENT)
+        {
+          apparmor_enabled = 0;
+          return 0;
+        }
 
-      size = TEMP_FAILURE_RETRY (read (fd, &buf, 2));
-
-      apparmor_enabled = size > 0 && buf[0] == 'Y' ? 1 : 0;
+      return crun_make_error (err, errno, "open `/sys/module/apparmor/parameters/enabled`");
     }
+
+  size = TEMP_FAILURE_RETRY (read (fd, &buf, 2));
+
+  apparmor_enabled = size > 0 && buf[0] == 'Y' ? 1 : 0;
 
   return apparmor_enabled;
 }
@@ -1040,10 +1047,7 @@ get_realpath_to_file (int dirfd, const char *path_name, char **absolute_path, li
       get_proc_self_fd_path (target_fd_path, targetfd);
       len = safe_readlinkat (AT_FDCWD, target_fd_path, absolute_path, 0, err);
       if (UNLIKELY (len < 0))
-        {
-          crun_error_release (err);
-          return crun_make_error (err, errno, "error unable to provide absolute path to file `%s`", path_name);
-        }
+        return crun_error_wrap (err, "error unable to provide absolute path to file `%s`", path_name);
     }
 
   return 0;
@@ -1097,21 +1101,35 @@ open_unix_domain_socket (const char *path, int dgram, libcrun_error_t *err)
   struct sockaddr_un addr = {};
   proc_fd_path_t name_buf;
   int ret;
+  cleanup_close int dirfd = -1;
   cleanup_close int fd = socket (AF_UNIX, dgram ? SOCK_DGRAM : SOCK_STREAM, 0);
   if (UNLIKELY (fd < 0))
     return crun_make_error (err, errno, "create UNIX socket");
 
   if (strlen (path) >= sizeof (addr.sun_path))
     {
-      get_proc_self_fd_path (name_buf, fd);
-      path = name_buf;
+      cleanup_free char *dpath = xstrdup (path);
+      cleanup_free char *bpath = xstrdup (path);
+      const char *parent_dir = dirname (dpath);
+      const char *base = basename (bpath);
+      int n;
+
+      dirfd = open (parent_dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+      if (UNLIKELY (dirfd < 0))
+        return crun_make_error (err, errno, "open directory `%s`", parent_dir);
+
+      get_proc_self_fd_path (name_buf, dirfd);
+
+      n = snprintf (addr.sun_path, sizeof (addr.sun_path), "%s/%s", name_buf, base);
+      if (n < 0 || (size_t) n >= sizeof (addr.sun_path))
+        return crun_make_error (err, ENAMETOOLONG, "socket path too long: `%s`", path);
+    }
+  else
+    {
+      size_t path_len = strlen (path);
+      memcpy (addr.sun_path, path, path_len + 1);
     }
 
-  size_t path_len = strlen (path);
-  if (path_len >= sizeof (addr.sun_path))
-    return crun_make_error (err, ENAMETOOLONG, "socket path too long: `%s`", path);
-
-  memcpy (addr.sun_path, path, path_len + 1);
   addr.sun_family = AF_UNIX;
   ret = bind (fd, (struct sockaddr *) &addr, sizeof (addr));
   if (UNLIKELY (ret < 0))
@@ -1450,7 +1468,6 @@ set_home_env (uid_t id)
   cleanup_free char *buf = NULL;
   long buf_size;
   cleanup_file FILE *stream = NULL;
-  int ret = -1;
 
   buf_size = sysconf (_SC_GETPW_R_SIZE_MAX);
   if (buf_size < 0)
@@ -1460,17 +1477,24 @@ set_home_env (uid_t id)
 
   stream = fopen ("/etc/passwd", "re");
   if (stream == NULL)
-    goto error;
+    return -1;
 
   for (;;)
     {
       struct passwd *ret_pw = NULL;
 
-      ret = fgetpwent_r (stream, &pwd, buf, buf_size, &ret_pw);
+      int ret = fgetpwent_r (stream, &pwd, buf, buf_size, &ret_pw);
       if (UNLIKELY (ret != 0))
         {
-          if (errno != ERANGE)
-            goto error;
+          if (ret == EINTR)
+            continue;
+
+          if (ret != ERANGE)
+            {
+              /* Let callers handle the error if the user was not found. */
+              errno = ret;
+              return -1;
+            }
 
           buf_size *= 2;
           buf = xrealloc (buf, buf_size);
@@ -1479,14 +1503,12 @@ set_home_env (uid_t id)
 
       if (ret_pw && ret_pw->pw_uid == id)
         {
-          setenv ("HOME", ret_pw->pw_dir, 1);
-          return 0;
+          if (UNLIKELY (setenv ("HOME", ret_pw->pw_dir, 1) < 0))
+            OOM ();
+          else
+            return 0;
         }
     }
-
-error:
-  /* Let callers handle the error if the user was not found. */
-  return ret ? -errno : 0;
 }
 
 /*if subuid or subgid exist, take the first range for the user */
@@ -1628,7 +1650,7 @@ unset_cloexec_flag (int fd)
 
 static void __attribute__ ((__noreturn__))
 run_process_child (char *path, char **args, const char *cwd, char **envp, int pipe_r,
-                   int pipe_w, int out_fd, int err_fd)
+                   int pipe_w, int out_fd, int err_fd, bool can_ignore_chdir_errors)
 {
   char *tmp_args[] = { path, NULL };
   libcrun_error_t err = NULL;
@@ -1669,7 +1691,10 @@ run_process_child (char *path, char **args, const char *cwd, char **envp, int pi
     args = tmp_args;
 
   if (cwd && chdir (cwd) < 0)
-    _safe_exit (EXIT_FAILURE);
+    {
+      if (! can_ignore_chdir_errors || (errno != EACCES && errno != EPERM))
+        _safe_exit (EXIT_FAILURE);
+    }
 
   execvpe (path, args, envp);
   _safe_exit (EXIT_FAILURE);
@@ -1679,7 +1704,7 @@ run_process_child (char *path, char **args, const char *cwd, char **envp, int pi
 int
 run_process_with_stdin_timeout_envp (char *path, char **args, const char *cwd, int timeout,
                                      char **envp, char *stdin, size_t stdin_len, int out_fd,
-                                     int err_fd, libcrun_error_t *err)
+                                     int err_fd, bool can_ignore_chdir_errors, libcrun_error_t *err)
 {
   int stdin_pipe[2];
   pid_t pid;
@@ -1715,7 +1740,7 @@ run_process_with_stdin_timeout_envp (char *path, char **args, const char *cwd, i
   if (pid == 0)
     {
       /* run_process_child doesn't return.  */
-      run_process_child (path, args, cwd, envp, pipe_r, pipe_w, out_fd, err_fd);
+      run_process_child (path, args, cwd, envp, pipe_r, pipe_w, out_fd, err_fd, can_ignore_chdir_errors);
     }
 
   close_and_reset (&pipe_r);
@@ -2253,6 +2278,7 @@ copy_recursive_fd_to_fd (int srcdirfd, int dfd, const char *srcname, const char 
             return ret;
 #endif
 
+          // copy_recursive_fd_to_fd closes srcfd and destfd
           ret = copy_recursive_fd_to_fd (srcfd, destfd, de->d_name, de->d_name, err);
           srcfd = destfd = -1;
           if (UNLIKELY (ret < 0))
@@ -2798,8 +2824,11 @@ channel_fd_pair_process (struct channel_fd_pair *channel, int epollfd, libcrun_e
       size_t used = ring_buffer_get_data_available (channel->rb);
       int events;
 
-      /* If there is space available in the buffer, we want to read more.  */
-      events = (available > 0) ? (EPOLLIN | (is_input_eagain ? EPOLLET : 0)) : 0;
+      /* If there is space available in the buffer and the output is not
+         blocked, we want to read more.  When the output got EAGAIN, stop
+         reading until the output fd becomes writable again to avoid a
+         busy loop when the consumer is not draining the pipe.  */
+      events = (available > 0 && ! is_output_eagain) ? (EPOLLIN | (is_input_eagain ? EPOLLET : 0)) : 0;
       if (events != channel->infd_epoll_events)
         {
           ret = epoll_helper_toggle (epollfd, channel->in_fd, events, err);

@@ -198,6 +198,72 @@ def test_createRuntime_hook():
         return -1
 
 
+def test_createRuntime_hook_bundle_path():
+    """Test that createRuntime hook receives correct bundle path."""
+    import tempfile
+    import json
+
+    conf = base_config()
+    add_all_namespaces(conf)
+    conf['process']['args'] = ['/init', 'true']
+
+    state_file = None
+    try:
+        # Create a temp file to capture hook state
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as f:
+            state_file = f.name
+
+        # Hook script that saves stdin (state) to file
+        hook = {
+            "path": "/bin/sh",
+            "args": ["/bin/sh", "-c", "cat > " + state_file]
+        }
+        conf['hooks'] = {"createRuntime": [hook]}
+
+        out, _ = run_and_get_output(conf, hide_stderr=True)
+
+        # Verify state was written and contains the correct bundle path
+        if os.path.exists(state_file) and os.path.getsize(state_file) > 0:
+            with open(state_file) as f:
+                state = json.load(f)
+
+                # Verify required fields exist
+                if not all(field in state for field in ['ociVersion', 'id', 'bundle', 'status']):
+                    logger.info("hook state missing required fields: %s", state)
+                    return -1
+
+                bundle_path = state['bundle']
+
+                # Bundle path should be an absolute path, not "/"
+                if bundle_path == "/" or bundle_path == "":
+                    logger.info("createRuntime hook received incorrect bundle path: '%s'", bundle_path)
+                    return -1
+
+                # Bundle path should exist and be a directory
+                if not os.path.isdir(bundle_path):
+                    logger.info("createRuntime hook bundle path is not a directory: '%s'", bundle_path)
+                    return -1
+
+                # Bundle should contain config.json
+                config_path = os.path.join(bundle_path, "config.json")
+                if not os.path.exists(config_path):
+                    logger.info("createRuntime hook bundle missing config.json: '%s'", bundle_path)
+                    return -1
+
+                logger.info("createRuntime hook received correct bundle path: '%s'", bundle_path)
+                return 0
+
+        logger.info("createRuntime hook did not receive state or state file is empty")
+        return -1
+
+    except Exception as e:
+        logger.info("test failed: %s", e)
+        return -1
+    finally:
+        if state_file and os.path.exists(state_file):
+            os.unlink(state_file)
+
+
 def test_createContainer_hook():
     """Test createContainer hook."""
     conf = base_config()
@@ -424,6 +490,76 @@ def test_annotation_hook_stdout_stderr():
             os.unlink(stderr_file)
 
 
+def _test_failing_poststop_hooks(hooks):
+    """Helper: verify that failing poststop hooks log a warning but container still succeeds."""
+    conf = base_config()
+    add_all_namespaces(conf)
+    conf['process']['args'] = ['/init', 'true']
+    conf['hooks'] = {"poststop": hooks}
+
+    try:
+        out, _ = run_and_get_output(conf)
+    except Exception as e:
+        logger.error("container failed unexpectedly: %s", e)
+        return -1
+
+    if "poststop hook failed with exit code" not in out:
+        logger.error("expected warning about poststop hook failure, got: %s", out)
+        return -1
+
+    return 0
+
+
+def test_poststop_hook_failure_warning():
+    """Test that a failing poststop hook logs a warning but container still succeeds."""
+    return _test_failing_poststop_hooks([{"path": "/bin/false"}])
+
+
+def test_multiple_poststop_hooks_failure():
+    """Test that multiple failing poststop hooks do not prevent container cleanup."""
+    return _test_failing_poststop_hooks([{"path": "/bin/false"}, {"path": "/bin/false"}])
+
+
+def test_poststart_fail_deletes_container():
+    """Test that the container is deleted when a poststart hook fails."""
+    conf = base_config()
+    add_all_namespaces(conf)
+    conf['process']['args'] = ['/init', 'true']
+
+    cid = None
+    try:
+        conf['hooks'] = {
+            "poststart": [{"path": "/bin/false"}],
+        }
+
+        proc, cid = run_and_get_output(conf, command='create', use_popen=True, hide_stderr=True)
+        proc.wait()
+
+        try:
+            run_crun_command(["start", cid])
+            logger.error("start succeeded but poststart hook should have failed")
+            return -1
+        except Exception:
+            pass
+
+        try:
+            run_crun_command(["state", cid])
+            logger.error("container still exists after poststart hook failure")
+            return -1
+        except Exception:
+            return 0
+
+    except Exception as e:
+        logger.error("test failed: %s", e)
+        return -1
+    finally:
+        if cid is not None:
+            try:
+                run_crun_command(["delete", "-f", cid])
+            except Exception:
+                pass
+
+
 all_tests = {
     "test-fail-prestart" : test_fail_prestart,
     "test-success-prestart" : test_success_prestart,
@@ -434,12 +570,16 @@ all_tests = {
     "test-poststart-hook": test_poststart_hook,
     "test-poststop-hook": test_poststop_hook,
     "test-createRuntime-hook": test_createRuntime_hook,
+    "test-createRuntime-hook-bundle-path": test_createRuntime_hook_bundle_path,
     "test-createContainer-hook": test_createContainer_hook,
     "test-startContainer-hook": test_startContainer_hook,
     "test-hook-with-timeout": test_hook_with_timeout,
     "test-hook-receives-state": test_hook_receives_state,
     "test-multiple-hooks": test_multiple_hooks,
     "test-annotation-hook-stdout-stderr": test_annotation_hook_stdout_stderr,
+    "test-poststop-hook-failure-warning": test_poststop_hook_failure_warning,
+    "test-multiple-poststop-hooks-failure": test_multiple_poststop_hooks_failure,
+    "test-poststart-fail-deletes-container": test_poststart_fail_deletes_container,
 }
 
 if __name__ == "__main__":
