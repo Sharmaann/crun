@@ -674,7 +674,8 @@ libcrun_get_containers_list (libcrun_container_list_t **out, const char *state_r
 
       if (! exists)
         {
-          libcrun_error (errno, "error opening file `%s`", status_file);
+          // TODO
+          // libcrun_error (errno, "error opening file `%s`", status_file);
           continue;
         }
 
